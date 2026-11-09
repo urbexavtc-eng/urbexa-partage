@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<!-- Aucune ressource extérieure sauf la lecture du trajet chez URBEXA (la carte passe par le serveur URBEXA). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src blob:; connect-src https://umlivamhrjolnkmurxcd.supabase.co; base-uri 'none'; form-action 'none'">
+<title>URBEXA · Trajet partagé</title>
+<style>
+  /* Couleurs du Design System « URBEXA Nocturne » (design/tokens.json). */
+  :root { --bg:#EFE9DE; --surface:#FBF8F2; --ligne:#E2D9C9; --encre:#16181A; --doux:#5E5A52; --or:#7C581F; --or-doux:#F1E6CF; --danger:#A43232; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0C0D0E; --surface:#16181A; --ligne:#24282B; --encre:#F3EEE4; --doux:#A8A49B; --or:#D6B370; --or-doux:#2A2620; --danger:#FFAAA3; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--encre); font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 520px; margin: 0 auto; padding: 24px 16px 40px; display:flex; flex-direction:column; gap:16px; }
+  .logo { font-family: Georgia, "Times New Roman", serif; letter-spacing: .5em; color: var(--or); font-size: 20px; }
+  h1 { font-family: Georgia, "Times New Roman", serif; font-weight: 400; font-size: 28px; margin: 0; }
+  .doux { color: var(--doux); }
+  .carte { width:100%; aspect-ratio: 2/1; border-radius: 20px; background: var(--surface); object-fit: cover; display:block; }
+  .bloc { background: var(--surface); border:1px solid var(--ligne); border-radius: 20px; padding: 16px; }
+  .ligne { display:flex; gap:12px; padding: 6px 0; }
+  .etiquette { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--doux); }
+  .heure { font-size: 22px; font-weight: 600; }
+  .alerte { border:1px solid var(--danger); color: var(--danger); border-radius: 12px; padding: 10px 12px; }
+  .pastille { display:inline-block; background: var(--or-doux); color: var(--or); border-radius: 999px; padding: 4px 12px; font-weight: 600; font-size: 14px; }
+  footer { font-size: 13px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <div class="logo" aria-label="URBEXA">URBEXA</div>
+
+  <section id="chargement" aria-live="polite"><p class="doux">Chargement du trajet…</p></section>
+
+  <section id="fini" hidden>
+    <h1>Ce trajet n’est plus partagé</h1>
+    <p class="doux">La course est terminée, ou la personne qui vous a envoyé ce lien a arrêté le partage.</p>
+  </section>
+
+  <section id="erreur" hidden>
+    <h1>Trajet momentanément indisponible</h1>
+    <p class="doux">Nouvelle tentative automatique dans quelques secondes.</p>
+  </section>
+
+  <section id="trajet" hidden>
+    <span class="pastille" id="etat"></span>
+    <h1 id="titre">Trajet en cours</h1>
+    <img id="carte" class="carte" alt="Carte : position du véhicule, départ et arrivée" hidden>
+    <p id="ancienne" class="alerte" hidden>La position n’a pas été mise à jour depuis plus d’une minute : elle peut être ancienne.</p>
+    <div class="bloc">
+      <div class="ligne"><div><div class="etiquette">Départ</div><div id="depart"></div></div></div>
+      <div class="ligne"><div><div class="etiquette">Arrivée</div><div id="arrivee"></div></div></div>
+    </div>
+    <div class="bloc" id="bloc-heure" hidden>
+      <div class="etiquette">Arrivée estimée</div>
+      <div class="heure" id="heure"></div>
+    </div>
+    <p class="doux" id="maj" aria-live="polite"></p>
+  </section>
+
+  <footer class="doux">Page de suivi partagée par un client URBEXA. Elle ne montre ni nom ni numéro de téléphone, et cesse de fonctionner à la fin de la course. En cas d’urgence, appelez le 112.</footer>
+</main>
+<script>
+(function () {
+  'use strict';
+  // Remplacé par scripts/page-partage.js au moment de préparer la page. Aucune clé ici : le jeton Mapbox reste sur le serveur.
+  var SUPABASE_URL = 'https://umlivamhrjolnkmurxcd.supabase.co';
+  var ETATS = { approche: 'Chauffeur en route', arrive: 'Chauffeur arrivé', en_cours: 'En route vers l’arrivée' };
+  var TITRES = { approche: 'Le chauffeur arrive', arrive: 'Le chauffeur est sur place', en_cours: 'Trajet en cours' };
+  // Le jeton ne doit pas rester dans l'adresse ni l'historique : il est gardé pour cet onglet seulement,
+  // pour qu'une actualisation de la page continue le suivi.
+  var jeton = new URLSearchParams(location.search).get('t') || '';
+  try {
+    if (jeton) sessionStorage.setItem('urbexa-partage', jeton);
+    else jeton = sessionStorage.getItem('urbexa-partage') || '';
+  } catch (e) { /* stockage indisponible : le suivi marche tant que la page reste ouverte */ }
+  if (history.replaceState) history.replaceState(null, '', location.pathname + '#suivi');
+  var minuteur = null;
+  var sombre = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+  function montrer(id) {
+    ['chargement', 'fini', 'erreur', 'trajet'].forEach(function (s) { document.getElementById(s).hidden = s !== id; });
+  }
+  function texte(id, valeur) { document.getElementById(id).textContent = valeur; }
+  function heure(iso) { return new Date(iso).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); }
+  function point(p) { return Number(p.longitude).toFixed(5) + ',' + Number(p.latitude).toFixed(5); }
+
+  var derniereCarte = 0;
+  var urlCarte = null;
+  // Carte relue au plus une fois par minute : une image coûte plus qu'une lecture du trajet.
+  function carte() {
+    if (Date.now() - derniereCarte < 60000) return;
+    derniereCarte = Date.now();
+    var img = document.getElementById('carte');
+    fetch(SUPABASE_URL + '/functions/v1/partage?carte=1&theme=' + (sombre ? 'sombre' : 'clair') + '&t=' + encodeURIComponent(jeton), { cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' })
+      .then(function (r) { return r.status === 200 ? r.blob() : null; })
+      .then(function (b) {
+        if (!b) { img.hidden = true; return; }
+        if (urlCarte) URL.revokeObjectURL(urlCarte);
+        urlCarte = URL.createObjectURL(b);
+        img.src = urlCarte;
+        img.hidden = false;
+      })
+      .catch(function () { /* la carte reste la précédente */ });
+  }
+
+  function afficher(d) {
+    if (!d.ok) { montrer('erreur'); return 15000; }
+    if (d.etat === 'termine') { montrer('fini'); return null; }
+    montrer('trajet');
+    texte('etat', ETATS[d.etat] || 'En cours');
+    texte('titre', TITRES[d.etat] || 'Trajet en cours');
+    texte('depart', d.depart.adresse);
+    texte('arrivee', d.arrivee.adresse);
+    var blocHeure = document.getElementById('bloc-heure');
+    blocHeure.hidden = !d.arrivee_estimee;
+    if (d.arrivee_estimee) texte('heure', heure(d.arrivee_estimee));
+    carte();
+    var ancienne = d.position && (Date.now() - Date.parse(d.position.depuis)) > 60000;
+    document.getElementById('ancienne').hidden = !ancienne;
+    texte('maj', 'Mis à jour à ' + heure(new Date().toISOString()) + '.');
+    return 15000;
+  }
+
+  function charger() {
+    clearTimeout(minuteur);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(jeton)) { montrer('fini'); return; }
+    fetch(SUPABASE_URL + '/functions/v1/partage?t=' + encodeURIComponent(jeton), { cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { var suite = afficher(d); if (suite) minuteur = setTimeout(charger, suite); })
+      .catch(function () { montrer('erreur'); minuteur = setTimeout(charger, 15000); });
+  }
+  // Pas de lecture inutile quand la page n'est pas affichée.
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) charger(); else clearTimeout(minuteur); });
+  charger();
+})();
+</script>
+</body>
+</html>
